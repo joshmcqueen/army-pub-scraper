@@ -7,12 +7,17 @@ Built for RAG testing and document research use cases — the corpus includes fi
 ## Installation
 
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
 ## Usage
 
 ```bash
+# Activate the virtual environment first
+source .venv/bin/activate
+
 # Download everything (thousands of PDFs — will take several hours)
 python scraper.py
 
