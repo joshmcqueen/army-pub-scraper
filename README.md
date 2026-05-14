@@ -29,33 +29,42 @@ deactivate
 
 ## Usage
 
+The scraper runs in two steps: first build a manifest of all publication URLs, then download from it. This lets you inspect what's available before committing to a long download, and avoids creating empty directories for categories that have no PDFs.
+
 ```bash
 # Activate the virtual environment
 source .venv/bin/activate
 
-# Download all categories (thousands of PDFs — will take several hours)
-python scraper.py
+# Step 1 — crawl all categories and record PDF URLs into downloads/manifest.jsonl
+python scraper.py build
 
-# Single category
-python scraper.py --category training_doctrine/FM
-
-# Preview without downloading
-python scraper.py --category training_doctrine/FM --dry-run
-
-# Limit downloads per category (useful for testing)
-python scraper.py --category administrative/AR --limit 10
-
-# Filter by publication status (ACTIVE, INACTIVE, or RESCINDED)
-python scraper.py --status ACTIVE
-
-# Adjust request delay in seconds (default: 1.5)
-python scraper.py --delay 2.0
-
-# Custom output directory
-python scraper.py --output /path/to/my/docs
+# Step 2 — download every PDF listed in the manifest
+python scraper.py download
 ```
 
-Run `python scraper.py --help` for the full option list.
+Both commands accept the same flags:
+
+```bash
+# Scope to a single category
+python scraper.py build --category training_doctrine/FM
+python scraper.py download --category training_doctrine/FM
+
+# Limit publications per category (good for testing)
+python scraper.py build --category administrative/AR --limit 10
+python scraper.py download --limit 10
+
+# Filter by publication status (ACTIVE, INACTIVE, or RESCINDED)
+python scraper.py build --status ACTIVE
+
+# Adjust request delay in seconds (default: 1.5)
+python scraper.py build --delay 2.0
+
+# Custom output directory (manifest and downloads land here)
+python scraper.py build --output /path/to/my/docs
+python scraper.py download --output /path/to/my/docs
+```
+
+Run `python scraper.py build --help` or `python scraper.py download --help` for the full option list.
 
 ## Categories
 
@@ -107,9 +116,27 @@ Run `python scraper.py --help` for the full option list.
 
 ## Output
 
-Files land in `downloads/{category}/` and are named using the official filename from the publication URL (e.g., `ARN43687-FM_1-000-WEB-2.pdf`).
+**`downloads/manifest.jsonl`** — written by `build`. One JSON object per publication, including those with no PDF:
 
-Every attempt is logged to `downloads/download_log.jsonl`:
+```json
+{
+  "pub_id": "1031029",
+  "pub_number": "FM 1",
+  "category": "training_doctrine/FM",
+  "status": "ACTIVE",
+  "date": "04/16/2025",
+  "title": "THE ARMY: A PRIMER TO OUR PROFESSION OF ARMS",
+  "proponent": "OCSA",
+  "pdf_url": "https://armypubs.army.mil/epubs/DR_pubs/DR_a/ARN43687-FM_1-000-WEB-2.pdf",
+  "scanned_at": "2026-05-14T18:13:45.123456"
+}
+```
+
+Publications with no downloadable PDF have `"pdf_url": null` and are skipped by `download`.
+
+**`downloads/{category}/{filename}.pdf`** — written by `download`. Files are named using the official filename from the URL (e.g., `ARN43687-FM_1-000-WEB-2.pdf`). Directories are only created when a file is actually written, so categories with no available PDFs leave no trace on disk.
+
+**`downloads/download_log.jsonl`** — written by `download`. One entry per attempted download:
 
 ```json
 {
@@ -124,9 +151,9 @@ Every attempt is logged to `downloads/download_log.jsonl`:
 }
 ```
 
-`result` values: `downloaded`, `skipped` (already exists), `no_pdf` (no downloadable file), `http_404`, `error:<message>`.
+`result` values: `downloaded`, `skipped` (already exists), `no_pdf`, `http_404`, `error:<message>`.
 
-The scraper skips any file that already exists with a non-zero size, so re-running after an interruption resumes where it left off.
+Both `build` and `download` are resumable — `build` skips pub_ids already in the manifest, and `download` skips files that already exist with a non-zero size.
 
 ## Notes
 

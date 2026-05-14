@@ -1,20 +1,23 @@
 """
-Army Publications Scraper
-Downloads PDFs from https://armypubs.army.mil organized by publication type.
+Army Publications Scraper — two-step workflow:
 
-Usage:
-  python scraper.py                                    # Download all categories
-  python scraper.py --category training_doctrine/FM   # Single category
-  python scraper.py --dry-run                          # List URLs without downloading
-  python scraper.py --delay 2.0                        # Request delay in seconds (default: 1.5)
-  python scraper.py --limit 10                         # Max downloads per category
-  python scraper.py --status ACTIVE                    # Filter: ACTIVE, INACTIVE, RESCINDED
-  python scraper.py --output ./my_downloads            # Custom output directory
+  Step 1: Build a manifest of all publications and their PDF URLs
+    python scraper.py build
+
+  Step 2: Download only the PDFs listed in the manifest
+    python scraper.py download
+
+Each command accepts:
+  --category training_doctrine/FM   # Scope to one category
+  --status ACTIVE                   # Filter: ACTIVE, INACTIVE, RESCINDED
+  --limit 10                        # Cap per category (useful for testing)
+  --delay 2.0                       # Seconds between requests (default: 1.5)
+  --output ./downloads              # Output directory (default: downloads)
+  --manifest manifest.jsonl         # Manifest filename (default: manifest.jsonl)
 """
 
 import argparse
 import json
-import os
 import time
 import urllib.parse
 from datetime import datetime
@@ -86,7 +89,11 @@ CATEGORIES = {
 }
 
 
-def make_session(delay: float) -> requests.Session:
+# ---------------------------------------------------------------------------
+# HTTP helpers
+# ---------------------------------------------------------------------------
+
+def make_session() -> requests.Session:
     session = requests.Session()
     session.headers.update({
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -120,6 +127,10 @@ def fetch_with_retry(session: requests.Session, url: str, delay: float, max_retr
     return None
 
 
+# ---------------------------------------------------------------------------
+# Parsing helpers
+# ---------------------------------------------------------------------------
+
 def fetch_category_page(session: requests.Session, aspx_slug: str, delay: float) -> List[dict]:
     url = f"{CATEGORY_BASE}/{aspx_slug}"
     resp = fetch_with_retry(session, url, delay)
@@ -133,21 +144,15 @@ def fetch_category_page(session: requests.Session, aspx_slug: str, delay: float)
         return []
 
     publications = []
-    rows = table.find_all("tr")
-    for row in rows[1:]:  # skip header row
+    for row in table.find_all("tr")[1:]:  # skip header
         cells = row.find_all("td")
         if len(cells) < 4:
             continue
-
         link = cells[0].find("a")
         if not link:
             continue
-
         href = link.get("href", "")
-        pub_id = None
-        if "PUB_ID=" in href:
-            pub_id = href.split("PUB_ID=")[-1].strip()
-
+        pub_id = href.split("PUB_ID=")[-1].strip() if "PUB_ID=" in href else None
         publications.append({
             "pub_id": pub_id,
             "pub_number": cells[0].get_text(strip=True),
@@ -168,12 +173,12 @@ def fetch_pdf_urls(session: requests.Session, pub_id: str, delay: float) -> List
         return []
 
     soup = BeautifulSoup(resp.text, "lxml")
-    pdf_urls = []
 
-    # Scope to the publication detail table only — the page nav has unrelated PDF links
+    # Scope to the detail table only — the site nav contains unrelated PDF links
     container = soup.find(id="MainContent_tblContainer1")
     search_root = container if container else soup
 
+    pdf_urls = []
     for a in search_root.find_all("a", href=True):
         href = a["href"]
         if ".pdf" not in href.lower():
@@ -181,8 +186,7 @@ def fetch_pdf_urls(session: requests.Session, pub_id: str, delay: float) -> List
         if href.startswith("http"):
             pdf_urls.append(href)
         elif href.startswith("../../"):
-            clean = href[6:]  # ../../epubs/... → /epubs/...
-            pdf_urls.append(f"{BASE_URL}/{clean}")
+            pdf_urls.append(f"{BASE_URL}/{href[6:]}")
         elif href.startswith("/"):
             pdf_urls.append(f"{BASE_URL}{href}")
         else:
@@ -191,10 +195,89 @@ def fetch_pdf_urls(session: requests.Session, pub_id: str, delay: float) -> List
     return pdf_urls
 
 
+# ---------------------------------------------------------------------------
+# Step 1: build
+# ---------------------------------------------------------------------------
+
+def cmd_build(args: argparse.Namespace) -> None:
+    output_dir = Path(args.output)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = output_dir / args.manifest
+
+    categories = _resolve_categories(args.category)
+    session = make_session()
+
+    total_found = 0
+    total_with_pdf = 0
+    total_no_pdf = 0
+
+    # Load already-processed pub_ids so we can resume an interrupted build
+    seen_ids: set = set()
+    if manifest_path.exists():
+        with open(manifest_path) as f:
+            for line in f:
+                try:
+                    seen_ids.add(json.loads(line)["pub_id"])
+                except (json.JSONDecodeError, KeyError):
+                    pass
+        print(f"Resuming — {len(seen_ids)} publications already in manifest.\n")
+
+    for category_path, aspx_slug in categories.items():
+        print(f"[{category_path}] Fetching listing...")
+        pubs = fetch_category_page(session, aspx_slug, args.delay)
+
+        if args.status:
+            pubs = [p for p in pubs if p["status"].upper() == args.status.upper()]
+
+        limit = args.limit or len(pubs)
+        pubs = pubs[:limit]
+        print(f"  {len(pubs)} publications")
+
+        for pub in tqdm(pubs, desc=category_path.split("/")[-1], unit="pub"):
+            pub_id = pub["pub_id"]
+            if not pub_id or pub_id in seen_ids:
+                continue
+
+            pdf_urls = fetch_pdf_urls(session, pub_id, args.delay)
+            pdf_url = pdf_urls[0] if pdf_urls else None
+
+            entry = {
+                "pub_id": pub_id,
+                "pub_number": pub["pub_number"],
+                "category": category_path,
+                "status": pub["status"],
+                "date": pub["date"],
+                "title": pub["title"],
+                "proponent": pub["proponent"],
+                "pdf_url": pdf_url,
+                "scanned_at": datetime.utcnow().isoformat(),
+            }
+
+            with open(manifest_path, "a") as f:
+                f.write(json.dumps(entry) + "\n")
+
+            seen_ids.add(pub_id)
+            total_found += 1
+            if pdf_url:
+                total_with_pdf += 1
+            else:
+                total_no_pdf += 1
+
+    print(f"\nManifest written to: {manifest_path}")
+    print(f"  Total scanned : {total_found}")
+    print(f"  With PDF      : {total_with_pdf}")
+    print(f"  No PDF        : {total_no_pdf}")
+
+
+# ---------------------------------------------------------------------------
+# Step 2: download
+# ---------------------------------------------------------------------------
+
 def download_pdf(session: requests.Session, pdf_url: str, dest_path: Path, delay: float) -> str:
     if dest_path.exists() and dest_path.stat().st_size > 0:
         return "skipped"
 
+    # Only create the directory when we're actually about to write a file
     dest_path.parent.mkdir(parents=True, exist_ok=True)
     time.sleep(delay)
 
@@ -204,10 +287,8 @@ def download_pdf(session: requests.Session, pdf_url: str, dest_path: Path, delay
             return f"http_{resp.status_code}"
 
         content_type = resp.headers.get("Content-Type", "")
-        if "pdf" not in content_type.lower() and "octet-stream" not in content_type.lower():
-            # Some publications are access-restricted or not available as PDF
-            if "text/html" in content_type.lower():
-                return "no_pdf"
+        if "text/html" in content_type.lower():
+            return "no_pdf"
 
         with open(dest_path, "wb") as f:
             for chunk in resp.iter_content(chunk_size=8192):
@@ -223,140 +304,133 @@ def download_pdf(session: requests.Session, pdf_url: str, dest_path: Path, delay
         return f"error:{e}"
 
 
-def log_result(log_path: Path, entry: dict) -> None:
-    with open(log_path, "a") as f:
-        f.write(json.dumps(entry) + "\n")
+def cmd_download(args: argparse.Namespace) -> None:
+    output_dir = Path(args.output)
+    manifest_path = output_dir / args.manifest
+    log_path = output_dir / "download_log.jsonl"
+
+    if not manifest_path.exists():
+        print(f"Manifest not found: {manifest_path}")
+        print("Run 'python scraper.py build' first.")
+        return
+
+    # Load manifest entries that have a PDF URL
+    entries = []
+    with open(manifest_path) as f:
+        for line in f:
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not entry.get("pdf_url"):
+                continue
+            if args.category and entry["category"] != args.category:
+                continue
+            if args.status and entry["status"].upper() != args.status.upper():
+                continue
+            entries.append(entry)
+
+    if not entries:
+        print("No downloadable entries found in manifest matching your filters.")
+        return
+
+    # Apply per-category limit if requested
+    if args.limit:
+        from collections import defaultdict
+        counts: Dict[str, int] = defaultdict(int)
+        filtered = []
+        for e in entries:
+            if counts[e["category"]] < args.limit:
+                filtered.append(e)
+                counts[e["category"]] += 1
+        entries = filtered
+
+    print(f"Downloading {len(entries)} PDFs...\n")
+
+    session = make_session()
+    results: Dict[str, int] = {"downloaded": 0, "skipped": 0, "errors": 0}
+
+    for entry in tqdm(entries, unit="pdf"):
+        pdf_url = entry["pdf_url"]
+        filename = pdf_url.split("/")[-1]
+        dest_path = output_dir / entry["category"] / filename
+
+        result = download_pdf(session, pdf_url, dest_path, args.delay)
+
+        if result == "downloaded":
+            results["downloaded"] += 1
+        elif result == "skipped":
+            results["skipped"] += 1
+        else:
+            results["errors"] += 1
+
+        with open(log_path, "a") as f:
+            f.write(json.dumps({
+                "pub_id": entry["pub_id"],
+                "pub_number": entry["pub_number"],
+                "category": entry["category"],
+                "status": entry["status"],
+                "pdf_url": pdf_url,
+                "local_path": str(dest_path),
+                "result": result,
+                "timestamp": datetime.utcnow().isoformat(),
+            }) + "\n")
+
+    print(f"\nDownloaded : {results['downloaded']}")
+    print(f"Skipped    : {results['skipped']}  (already existed)")
+    print(f"Errors     : {results['errors']}")
+    print(f"\nLog written to: {log_path}")
 
 
-def scrape_category(
-    session: requests.Session,
-    category_path: str,
-    aspx_slug: str,
-    output_dir: Path,
-    log_path: Path,
-    args: argparse.Namespace,
-) -> dict:
-    print(f"\n[{category_path}] Fetching listing...")
-    pubs = fetch_category_page(session, aspx_slug, args.delay)
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
-    if not pubs:
-        print(f"  No publications found.")
-        return {"total": 0, "downloaded": 0, "skipped": 0, "no_pdf": 0, "errors": 0}
-
-    # Filter by status if requested
-    if args.status:
-        pubs = [p for p in pubs if p["status"].upper() == args.status.upper()]
-
-    print(f"  Found {len(pubs)} publications" + (f" (filtered to {args.status})" if args.status else ""))
-
-    dest_dir = output_dir / category_path
-    dest_dir.mkdir(parents=True, exist_ok=True)
-
-    counts = {"total": len(pubs), "downloaded": 0, "skipped": 0, "no_pdf": 0, "errors": 0}
-    limit = args.limit if args.limit else len(pubs)
-
-    for i, pub in enumerate(tqdm(pubs[:limit], desc=category_path.split("/")[-1], unit="pub")):
-        pub_id = pub["pub_id"]
-        if not pub_id:
-            continue
-
-        if args.dry_run:
-            print(f"  [DRY RUN] {pub['pub_number']} | {pub['status']} | {pub['title'][:60]}")
-            continue
-
-        pdf_urls = fetch_pdf_urls(session, pub_id, args.delay)
-
-        if not pdf_urls:
-            counts["no_pdf"] += 1
-            log_result(log_path, {
-                "pub_id": pub_id, "pub_number": pub["pub_number"],
-                "category": category_path, "status": pub["status"],
-                "pdf_url": None, "local_path": None,
-                "result": "no_pdf", "timestamp": datetime.utcnow().isoformat(),
-            })
-            continue
-
-        # Download all available PDFs for this publication
-        for pdf_url in pdf_urls:
-            filename = pdf_url.split("/")[-1]
-            dest_path = dest_dir / filename
-
-            result = download_pdf(session, pdf_url, dest_path, args.delay)
-
-            if result == "downloaded":
-                counts["downloaded"] += 1
-            elif result == "skipped":
-                counts["skipped"] += 1
-            elif result == "no_pdf":
-                counts["no_pdf"] += 1
-            else:
-                counts["errors"] += 1
-
-            log_result(log_path, {
-                "pub_id": pub_id, "pub_number": pub["pub_number"],
-                "category": category_path, "status": pub["status"],
-                "pdf_url": pdf_url, "local_path": str(dest_path),
-                "result": result, "timestamp": datetime.utcnow().isoformat(),
-            })
-
-            # Only download first PDF per publication by default
-            break
-
-    return counts
-
-
-def print_summary(all_counts: Dict[str, dict]) -> None:
-    total = {"total": 0, "downloaded": 0, "skipped": 0, "no_pdf": 0, "errors": 0}
-    print("\n" + "=" * 60)
-    print(f"{'CATEGORY':<40} {'TOTAL':>6} {'DL':>6} {'SKIP':>6} {'NOPDF':>6} {'ERR':>6}")
-    print("-" * 60)
-    for cat, counts in all_counts.items():
-        label = cat.split("/")[-1]
-        print(f"{label:<40} {counts['total']:>6} {counts['downloaded']:>6} "
-              f"{counts['skipped']:>6} {counts['no_pdf']:>6} {counts['errors']:>6}")
-        for k in total:
-            total[k] += counts[k]
-    print("-" * 60)
-    print(f"{'TOTAL':<40} {total['total']:>6} {total['downloaded']:>6} "
-          f"{total['skipped']:>6} {total['no_pdf']:>6} {total['errors']:>6}")
-    print("=" * 60)
+def _resolve_categories(category_arg: Optional[str]) -> Dict[str, str]:
+    if not category_arg:
+        return CATEGORIES
+    if category_arg not in CATEGORIES:
+        print(f"Unknown category: {category_arg}")
+        print("Available categories:")
+        for cat in CATEGORIES:
+            print(f"  {cat}")
+        raise SystemExit(1)
+    return {category_arg: CATEGORIES[category_arg]}
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Army Publications PDF Scraper")
-    parser.add_argument("--category", help="Single category to scrape (e.g. training_doctrine/FM)")
-    parser.add_argument("--dry-run", action="store_true", help="List publications without downloading")
-    parser.add_argument("--delay", type=float, default=1.5, help="Seconds between requests (default: 1.5)")
-    parser.add_argument("--limit", type=int, default=0, help="Max publications per category (0 = all)")
-    parser.add_argument("--status", help="Filter by status: ACTIVE, INACTIVE, RESCINDED")
-    parser.add_argument("--output", default="downloads", help="Output directory (default: downloads)")
+    parser = argparse.ArgumentParser(
+        description="Army Publications scraper — two-step workflow: build then download.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    shared = argparse.ArgumentParser(add_help=False)
+    shared.add_argument("--category", help="Scope to one category (e.g. training_doctrine/FM)")
+    shared.add_argument("--status", help="Filter by status: ACTIVE, INACTIVE, RESCINDED")
+    shared.add_argument("--limit", type=int, default=0, help="Max publications per category (0 = all)")
+    shared.add_argument("--delay", type=float, default=1.5, help="Seconds between requests (default: 1.5)")
+    shared.add_argument("--output", default="downloads", help="Output directory (default: downloads)")
+    shared.add_argument("--manifest", default="manifest.jsonl", help="Manifest filename (default: manifest.jsonl)")
+
+    subparsers.add_parser(
+        "build",
+        help="Crawl all categories and record PDF URLs into a manifest (no downloading).",
+        parents=[shared],
+    )
+    subparsers.add_parser(
+        "download",
+        help="Download PDFs listed in the manifest.",
+        parents=[shared],
+    )
+
     args = parser.parse_args()
 
-    output_dir = Path(args.output)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    log_path = output_dir / "download_log.jsonl"
-
-    session = make_session(args.delay)
-
-    if args.category:
-        if args.category not in CATEGORIES:
-            print(f"Unknown category: {args.category}")
-            print("Available categories:")
-            for cat in CATEGORIES:
-                print(f"  {cat}")
-            return
-        categories = {args.category: CATEGORIES[args.category]}
-    else:
-        categories = CATEGORIES
-
-    all_counts = {}
-    for category_path, aspx_slug in categories.items():
-        counts = scrape_category(session, category_path, aspx_slug, output_dir, log_path, args)
-        all_counts[category_path] = counts
-
-    if not args.dry_run:
-        print_summary(all_counts)
-        print(f"\nLog written to: {log_path}")
+    if args.command == "build":
+        cmd_build(args)
+    elif args.command == "download":
+        cmd_download(args)
 
 
 if __name__ == "__main__":
