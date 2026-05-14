@@ -231,12 +231,19 @@ def cmd_build(args: argparse.Namespace) -> None:
 
         limit = args.limit or len(pubs)
         pubs = pubs[:limit]
-        print(f"  {len(pubs)} publications")
 
-        for pub in tqdm(pubs, desc=category_path.split("/")[-1], unit="pub"):
+        # Filter to only pubs not yet in the manifest
+        new_pubs = [p for p in pubs if p.get("pub_id") and p["pub_id"] not in seen_ids]
+        if not new_pubs:
+            print(f"  {len(pubs)} publications — already complete, skipping.")
+            continue
+        if len(new_pubs) < len(pubs):
+            print(f"  {len(pubs)} publications — resuming ({len(new_pubs)} remaining)")
+        else:
+            print(f"  {len(pubs)} publications")
+
+        for pub in tqdm(new_pubs, desc=category_path.split("/")[-1], unit="pub"):
             pub_id = pub["pub_id"]
-            if not pub_id or pub_id in seen_ids:
-                continue
 
             pdf_urls = fetch_pdf_urls(session, pub_id, args.delay)
             pdf_url = pdf_urls[0] if pdf_urls else None
