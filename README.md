@@ -17,59 +17,74 @@ cd army-pub-scraper
 
 python3 -m venv .venv
 source .venv/bin/activate
-
 pip install -r requirements.txt
 ```
 
-To deactivate the virtual environment when you're done:
+## Quick Start
 
 ```bash
-deactivate
-```
-
-## Usage
-
-The scraper runs in two steps: first build a manifest of all publication URLs, then download from it. This lets you inspect what's available before committing to a long download, and avoids creating empty directories for categories that have no PDFs.
-
-```bash
-# Activate the virtual environment
 source .venv/bin/activate
 
-# Step 1 — crawl all categories and record PDF URLs into downloads/manifest.jsonl
+# Step 1 — crawl all categories and write downloads/manifest.jsonl (no downloading yet)
 python scraper.py build
 
 # Step 2 — download every PDF listed in the manifest
 python scraper.py download
 ```
 
-Both commands accept the same flags:
+The full build + download run covers thousands of publications and will take several hours. Use `--category` and `--limit` to test with a subset first (see below).
+
+## Two-Step Workflow
+
+Splitting into two steps lets you inspect what's available before committing to a long download, and avoids creating empty directories for categories that have no public PDFs.
+
+### `build` — scan and record PDF URLs
 
 ```bash
-# Scope to a single category
+# All categories
+python scraper.py build
+
+# One category only
 python scraper.py build --category training_doctrine/FM
-python scraper.py download --category training_doctrine/FM
 
-# Limit publications per category (good for testing)
+# Limit per category (useful for a quick smoke test)
 python scraper.py build --category administrative/AR --limit 10
-python scraper.py download --limit 10
 
-# Filter by publication status (ACTIVE, INACTIVE, or RESCINDED)
+# Active publications only
 python scraper.py build --status ACTIVE
 
-# Adjust request delay in seconds (default: 1.5)
-python scraper.py build --delay 2.0
-
-# Custom output directory (manifest and downloads land here)
-python scraper.py build --output /path/to/my/docs
-python scraper.py download --output /path/to/my/docs
+# Resume an interrupted build (already-seen pub_ids are skipped automatically)
+python scraper.py build
 ```
+
+### `download` — pull PDFs from the manifest
+
+```bash
+# Download everything in the manifest
+python scraper.py download
+
+# One category only
+python scraper.py download --category training_doctrine/FM
+
+# Limit per category
+python scraper.py download --limit 10
+
+# Slow down requests if you're seeing rate limiting
+python scraper.py download --delay 2.0
+
+# Resume after interruption (existing files are skipped automatically)
+python scraper.py download
+```
+
+Both commands accept `--output` to change the base directory (default: `downloads/`) and `--manifest` to change the manifest filename (default: `manifest.jsonl`).
 
 Run `python scraper.py build --help` or `python scraper.py download --help` for the full option list.
 
 ## Categories
 
-| Path | Publications |
-|------|-------------|
+### Administrative
+| `--category` | Publication Type |
+|---|---|
 | `administrative/AR` | Army Regulations |
 | `administrative/ALARACT` | Army ALARACT Messages |
 | `administrative/ArmyDir` | Army Directives |
@@ -81,6 +96,10 @@ Run `python scraper.py build --help` or `python scraper.py download --help` for 
 | `administrative/POG` | Principal Officials' Guidance |
 | `administrative/PPM` | Proponent Policy Memorandums |
 | `administrative/Web_Series` | Administrative Series Collection |
+
+### Technical & Equipment
+| `--category` | Publication Type |
+|---|---|
 | `technical_equipment/EM` | Electronic Media |
 | `technical_equipment/FT` | Firing Tables |
 | `technical_equipment/LO` | Lubrication Orders |
@@ -95,6 +114,10 @@ Run `python scraper.py build --help` or `python scraper.py download --help` for 
 | `technical_equipment/TM_11_5` | Technical Manuals (Range 11-5) |
 | `technical_equipment/TM_11_6_7` | Technical Manuals (Range 11-6 & 7) |
 | `technical_equipment/TM_14_750` | Technical Manuals (Range ≥14) |
+
+### Training & Doctrine
+| `--category` | Publication Type |
+|---|---|
 | `training_doctrine/ADP` | Army Doctrine Publications |
 | `training_doctrine/ADRP` | Army Doctrine Reference Publications |
 | `training_doctrine/ATP` | Army Techniques Publications |
@@ -106,17 +129,30 @@ Run `python scraper.py build --help` or `python scraper.py download --help` for 
 | `training_doctrine/PB` | Professional Bulletins |
 | `training_doctrine/STP` | Soldier Training Publications |
 | `training_doctrine/TC` | Training Circulars |
+
+### Engineering
+| `--category` | Publication Type |
+|---|---|
 | `engineering/TM` | Technical Manuals |
 | `engineering/TB` | Technical Bulletins |
+
+### Medical
+| `--category` | Publication Type |
+|---|---|
 | `medical/TM` | Technical Manuals |
 | `medical/TB` | Technical Bulletins |
 | `medical/SB` | Supply Bulletins |
 | `medical/SC` | Supply Catalogs |
+
+### Miscellaneous
+| `--category` | Publication Type |
+|---|---|
 | `miscellaneous/MCM` | Manuals for Courts-Martial |
 
-## Output
+## Output Files
 
-**`downloads/manifest.jsonl`** — written by `build`. One JSON object per publication, including those with no PDF:
+### `downloads/manifest.jsonl`
+Written by `build`. One JSON object per publication, including those with no available PDF (`"pdf_url": null`). Safe to inspect or filter with `jq` before running `download`.
 
 ```json
 {
@@ -132,11 +168,11 @@ Run `python scraper.py build --help` or `python scraper.py download --help` for 
 }
 ```
 
-Publications with no downloadable PDF have `"pdf_url": null` and are skipped by `download`.
+### `downloads/{category}/{filename}.pdf`
+Written by `download`. Named using the official filename from the source URL (e.g., `ARN43687-FM_1-000-WEB-2.pdf`). Directories are only created when a file is actually written — categories with no available PDFs leave no trace on disk.
 
-**`downloads/{category}/{filename}.pdf`** — written by `download`. Files are named using the official filename from the URL (e.g., `ARN43687-FM_1-000-WEB-2.pdf`). Directories are only created when a file is actually written, so categories with no available PDFs leave no trace on disk.
-
-**`downloads/download_log.jsonl`** — written by `download`. One entry per attempted download:
+### `downloads/download_log.jsonl`
+Written by `download`. One entry per attempted download.
 
 ```json
 {
@@ -153,10 +189,8 @@ Publications with no downloadable PDF have `"pdf_url": null` and are skipped by 
 
 `result` values: `downloaded`, `skipped` (already exists), `no_pdf`, `http_404`, `error:<message>`.
 
-Both `build` and `download` are resumable — `build` skips pub_ids already in the manifest, and `download` skips files that already exist with a non-zero size.
-
 ## Notes
 
 - Only public/unclassified documents are available without a CAC (Common Access Card)
-- Some publications are listed as ACTIVE but have no downloadable PDF — these are logged as `no_pdf`
+- Some publications are listed as ACTIVE but have no downloadable PDF — these appear in the manifest with `"pdf_url": null` and are skipped by `download`
 - The `downloads/` and `.venv/` directories are excluded from git via `.gitignore`
