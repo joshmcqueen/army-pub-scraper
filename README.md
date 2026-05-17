@@ -30,15 +30,18 @@ python scraper.py build
 
 # Step 2 — download every PDF listed in the manifest
 python scraper.py download
+
+# Print manifest and download coverage statistics at any time
+python scraper.py stats
 ```
 
 The full build + download run covers thousands of publications and will take several hours. Use `--category` and `--limit` to test with a subset first (see below).
 
-## Two-Step Workflow
-
-Splitting into two steps lets you inspect what's available before committing to a long download, and avoids creating empty directories for categories that have no public PDFs.
+## Commands
 
 ### `build` — scan and record PDF URLs
+
+Crawls every category page, visits each publication's detail page, and records the PDF URL (or `null` if none is available) into `manifest.jsonl`. Safe to interrupt and resume — already-processed pub IDs are skipped.
 
 ```bash
 # All categories
@@ -57,7 +60,20 @@ python scraper.py build --status ACTIVE
 python scraper.py build
 ```
 
+At the end of every `build` run, a full manifest summary is printed (see `stats` below).
+
 ### `download` — pull PDFs from the manifest
+
+Before making any requests, `download` classifies every manifest entry:
+
+| Class | Action |
+|---|---|
+| Already on disk (non-empty file exists) | Skip |
+| Permanent failure in log (`404`, `403`, `no_pdf`, `empty`) | Skip |
+| Transient failure in log (`SSLError`, `503`, timeout, etc.) | **Retry** |
+| Never attempted | Download |
+
+Re-running `download` is safe — it always picks up where it left off and automatically retries anything that failed for a recoverable reason.
 
 ```bash
 # Download everything in the manifest
@@ -72,13 +88,75 @@ python scraper.py download --limit 10
 # Slow down requests if you're seeing rate limiting
 python scraper.py download --delay 2.0
 
-# Resume after interruption (existing files are skipped automatically)
+# Resume after interruption — existing files are skipped, transient errors are retried
 python scraper.py download
 ```
 
-Both commands accept `--output` to change the base directory (default: `downloads/`) and `--manifest` to change the manifest filename (default: `manifest.jsonl`).
+**Example pre-flight output:**
 
-Run `python scraper.py build --help` or `python scraper.py download --help` for the full option list.
+```
+Scanning manifest...
+
+  Already on disk         :  4,393  (skipping)
+  Permanent failures      :      1  (skipping — 404/403/no_pdf)
+  Transient failures      :    738  (retrying)
+  Never attempted         :      0  (new)
+  ──────────────────────────────────
+  Work this run           :    738
+```
+
+**Example session summary:**
+
+```
+=== Session Results ===
+
+  Downloaded (new)        :     48  (24.3 MB)
+  Downloaded (retried)    :      5
+  Skipped (on disk)       :  4,393
+  Skipped (permanent err) :      1
+  Failed this run         :    685
+
+  Failures by type:
+    error:SSLError             :    682
+    http_503                   :      3
+
+  Log written to: downloads/download_log.jsonl
+```
+
+### `stats` — print manifest and download coverage
+
+Reads `manifest.jsonl` and the on-disk file tree to show current coverage without making any network requests. Useful for analysis or a quick status check at any point in the process.
+
+```bash
+python scraper.py stats
+```
+
+**Example output:**
+
+```
+=== Manifest Summary ===
+
+  Total publications  : 14,953
+  With PDF URL        : 5,132  (34.3%)
+  No PDF URL          : 9,821  (65.7%)
+  Already on disk     : 4,441  (86.5% of those with PDF)
+  Still to download   :   691  (13.5% of those with PDF)
+
+  By status:
+    ACTIVE               : 14,759  (98.7%)
+    INACTIVE             :    194  ( 1.3%)
+
+  By category group:
+    administrative         :  4,082  (27.3%)
+    miscellaneous          :      1  ( 0.0%)
+    technical_equipment    :  9,514  (63.6%)
+    training_doctrine      :  1,356  ( 9.1%)
+
+  Unique proponents   : 175
+  Publication dates   : 15 Sep 1940 – 01 Jun 2026
+```
+
+All three commands accept `--output` to change the base directory (default: `downloads/`) and `--manifest` to change the manifest filename (default: `manifest.jsonl`).
 
 ## Categories
 
@@ -172,7 +250,7 @@ Written by `build`. One JSON object per publication, including those with no ava
 Written by `download`. Named using the official filename from the source URL (e.g., `ARN43687-FM_1-000-WEB-2.pdf`). Directories are only created when a file is actually written — categories with no available PDFs leave no trace on disk.
 
 ### `downloads/download_log.jsonl`
-Written by `download`. One entry per attempted download.
+Written by `download`. One entry per attempted download (appended across runs — last result per pub ID wins for resume logic).
 
 ```json
 {
@@ -183,14 +261,15 @@ Written by `download`. One entry per attempted download.
   "pdf_url": "https://armypubs.army.mil/epubs/DR_pubs/DR_a/ARN43687-FM_1-000-WEB-2.pdf",
   "local_path": "downloads/training_doctrine/FM/ARN43687-FM_1-000-WEB-2.pdf",
   "result": "downloaded",
+  "bytes": 2457600,
   "timestamp": "2026-05-14T18:13:58.486163"
 }
 ```
 
-`result` values: `downloaded`, `skipped` (already exists), `no_pdf`, `http_404`, `error:<message>`.
+`result` values: `downloaded`, `skipped` (already on disk), `no_pdf`, `http_404`, `http_503`, `error:SSLError`, `error:ConnectionError`, etc.
 
 ## Notes
 
-- Only public/unclassified documents are available without a CAC (Common Access Card)
-- Some publications are listed as ACTIVE but have no downloadable PDF — these appear in the manifest with `"pdf_url": null` and are skipped by `download`
-- The `downloads/` and `.venv/` directories are excluded from git via `.gitignore`
+- Only public/unclassified documents are available without a CAC (Common Access Card). Some URLs redirect to `federation.eams.army.mil` (DoD SSO) and will fail with an SSL error — these are flagged as transient and retried each run, but will not resolve without a valid CAC session.
+- Some publications are listed as ACTIVE but have no downloadable PDF — these appear in the manifest with `"pdf_url": null` and are skipped by `download`.
+- The `downloads/` and `.venv/` directories are excluded from git via `.gitignore`.

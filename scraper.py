@@ -7,6 +7,9 @@ Army Publications Scraper — two-step workflow:
   Step 2: Download only the PDFs listed in the manifest
     python scraper.py download
 
+  Step 3: Print manifest statistics
+    python scraper.py stats
+
 Each command accepts:
   --category training_doctrine/FM   # Scope to one category
   --status ACTIVE                   # Filter: ACTIVE, INACTIVE, RESCINDED
@@ -20,6 +23,7 @@ import argparse
 import json
 import time
 import urllib.parse
+from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -271,44 +275,153 @@ def cmd_build(args: argparse.Namespace) -> None:
                 total_no_pdf += 1
 
     print(f"\nManifest written to: {manifest_path}")
-    print(f"  Total scanned : {total_found}")
-    print(f"  With PDF      : {total_with_pdf}")
-    print(f"  No PDF        : {total_no_pdf}")
+    if total_found:
+        print(f"  Added this run  : {total_found}  (with PDF: {total_with_pdf}, no PDF: {total_no_pdf})")
+    else:
+        print("  Nothing new added this run — manifest is already up to date.")
+
+    print()
+    _print_manifest_stats(manifest_path, Path(args.output))
+
+
+# ---------------------------------------------------------------------------
+# Manifest statistics
+# ---------------------------------------------------------------------------
+
+def _print_manifest_stats(manifest_path: Path, output_dir: Path) -> None:
+    entries = []
+    with open(manifest_path) as f:
+        for line in f:
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+
+    if not entries:
+        print("Manifest is empty.")
+        return
+
+    total = len(entries)
+    with_pdf = [e for e in entries if e.get("pdf_url")]
+    no_pdf = total - len(with_pdf)
+
+    # Check which PDFs are already on disk
+    on_disk = 0
+    for e in with_pdf:
+        filename = e["pdf_url"].split("/")[-1]
+        local_path = output_dir / e["category"] / filename
+        if local_path.exists() and local_path.stat().st_size > 0:
+            on_disk += 1
+
+    still_needed = len(with_pdf) - on_disk
+
+    # Status breakdown
+    status_counts: Counter = Counter(e.get("status", "Unknown") for e in entries)
+
+    # Category group breakdown (top-level before the /)
+    group_counts: Counter = Counter(e["category"].split("/")[0] for e in entries)
+
+    # Unique proponents
+    proponents = {e.get("proponent", "").strip() for e in entries if e.get("proponent", "").strip()}
+
+    # Publication date range
+    pub_dates = []
+    for e in entries:
+        raw = e.get("date", "")
+        try:
+            pub_dates.append(datetime.strptime(raw, "%m/%d/%Y"))
+        except (ValueError, TypeError):
+            pass
+
+    def _pct(n: int, d: int) -> str:
+        return f"{n / d * 100:.1f}%" if d else "—"
+
+    print("=== Manifest Summary ===\n")
+    print(f"  Total publications  : {total:,}")
+    print(f"  With PDF URL        : {len(with_pdf):,}  ({_pct(len(with_pdf), total)})")
+    print(f"  No PDF URL          : {no_pdf:,}  ({_pct(no_pdf, total)})")
+    if with_pdf:
+        print(f"  Already on disk     : {on_disk:,}  ({_pct(on_disk, len(with_pdf))} of those with PDF)")
+        print(f"  Still to download   : {still_needed:,}  ({_pct(still_needed, len(with_pdf))} of those with PDF)")
+
+    print()
+    print("  By status:")
+    for status, count in sorted(status_counts.items(), key=lambda x: -x[1]):
+        print(f"    {status:<20} : {count:>6,}  ({_pct(count, total)})")
+
+    print()
+    print("  By category group:")
+    for group, count in sorted(group_counts.items()):
+        print(f"    {group:<22} : {count:>6,}  ({_pct(count, total)})")
+
+    print()
+    print(f"  Unique proponents   : {len(proponents):,}")
+
+    if pub_dates:
+        earliest = min(pub_dates).strftime("%d %b %Y")
+        latest   = max(pub_dates).strftime("%d %b %Y")
+        print(f"  Publication dates   : {earliest} – {latest}")
+
+    print()
+
+
+def cmd_stats(args: argparse.Namespace) -> None:
+    manifest_path = Path(args.output) / args.manifest
+    if not manifest_path.exists():
+        print(f"Manifest not found: {manifest_path}")
+        print("Run 'python scraper.py build' first.")
+        return
+    _print_manifest_stats(manifest_path, Path(args.output))
 
 
 # ---------------------------------------------------------------------------
 # Step 2: download
 # ---------------------------------------------------------------------------
 
-def download_pdf(session: requests.Session, pdf_url: str, dest_path: Path, delay: float) -> str:
-    if dest_path.exists() and dest_path.stat().st_size > 0:
-        return "skipped"
+# Errors that won't resolve on retry (permanent failures)
+_PERMANENT_ERRORS = {"http_404", "http_403", "http_410", "no_pdf", "empty"}
 
-    # Only create the directory when we're actually about to write a file
+
+def _fmt_bytes(n: int) -> str:
+    if n >= 1_073_741_824:
+        return f"{n / 1_073_741_824:.1f} GB"
+    if n >= 1_048_576:
+        return f"{n / 1_048_576:.1f} MB"
+    if n >= 1024:
+        return f"{n / 1024:.1f} KB"
+    return f"{n} B"
+
+
+def download_pdf(session: requests.Session, pdf_url: str, dest_path: Path, delay: float):
+    """Returns (result_code: str, file_bytes: int)."""
+    if dest_path.exists() and dest_path.stat().st_size > 0:
+        return "skipped", dest_path.stat().st_size
+
     dest_path.parent.mkdir(parents=True, exist_ok=True)
     time.sleep(delay)
 
     try:
         resp = session.get(pdf_url, stream=True, timeout=60)
         if resp.status_code != 200:
-            return f"http_{resp.status_code}"
+            return f"http_{resp.status_code}", 0
 
         content_type = resp.headers.get("Content-Type", "")
         if "text/html" in content_type.lower():
-            return "no_pdf"
+            return "no_pdf", 0
 
         with open(dest_path, "wb") as f:
             for chunk in resp.iter_content(chunk_size=8192):
                 if chunk:
                     f.write(chunk)
 
-        if dest_path.stat().st_size == 0:
+        size = dest_path.stat().st_size
+        if size == 0:
             dest_path.unlink()
-            return "empty"
+            return "empty", 0
 
-        return "downloaded"
+        return "downloaded", size
     except requests.RequestException as e:
-        return f"error:{e}"
+        return f"error:{type(e).__name__}", 0
 
 
 def cmd_download(args: argparse.Namespace) -> None:
@@ -321,8 +434,9 @@ def cmd_download(args: argparse.Namespace) -> None:
         print("Run 'python scraper.py build' first.")
         return
 
-    # Load manifest entries that have a PDF URL
-    entries = []
+    # --- Load manifest (apply filters) ---
+    print("Scanning manifest...")
+    all_entries = []
     with open(manifest_path) as f:
         for line in f:
             try:
@@ -335,58 +449,129 @@ def cmd_download(args: argparse.Namespace) -> None:
                 continue
             if args.status and entry["status"].upper() != args.status.upper():
                 continue
-            entries.append(entry)
+            all_entries.append(entry)
 
-    if not entries:
+    if not all_entries:
         print("No downloadable entries found in manifest matching your filters.")
         return
 
-    # Apply per-category limit if requested
     if args.limit:
-        from collections import defaultdict
         counts: Dict[str, int] = defaultdict(int)
         filtered = []
-        for e in entries:
+        for e in all_entries:
             if counts[e["category"]] < args.limit:
                 filtered.append(e)
                 counts[e["category"]] += 1
-        entries = filtered
+        all_entries = filtered
 
-    print(f"Downloading {len(entries)} PDFs...\n")
+    # --- Build prior-results index from log (last result per pub_id wins) ---
+    prior_results: Dict[str, str] = {}
+    if log_path.exists():
+        with open(log_path) as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                    prior_results[rec["pub_id"]] = rec["result"]
+                except (json.JSONDecodeError, KeyError):
+                    pass
 
-    session = make_session()
-    results: Dict[str, int] = {"downloaded": 0, "skipped": 0, "errors": 0}
+    # --- Pre-classify each entry ---
+    on_disk: List[dict] = []
+    to_retry: List[dict] = []      # previously failed with a transient error
+    permanent_skip: List[dict] = []  # previously failed with a permanent error
+    new_work: List[dict] = []
 
-    for entry in tqdm(entries, unit="pdf"):
-        pdf_url = entry["pdf_url"]
-        filename = pdf_url.split("/")[-1]
-        dest_path = output_dir / entry["category"] / filename
-
-        result = download_pdf(session, pdf_url, dest_path, args.delay)
-
-        if result == "downloaded":
-            results["downloaded"] += 1
-        elif result == "skipped":
-            results["skipped"] += 1
+    for e in all_entries:
+        filename = e["pdf_url"].split("/")[-1]
+        dest_path = output_dir / e["category"] / filename
+        if dest_path.exists() and dest_path.stat().st_size > 0:
+            on_disk.append(e)
+        elif e["pub_id"] in prior_results:
+            prior = prior_results[e["pub_id"]]
+            if prior in _PERMANENT_ERRORS:
+                permanent_skip.append(e)
+            else:
+                to_retry.append(e)
         else:
-            results["errors"] += 1
+            new_work.append(e)
 
-        with open(log_path, "a") as f:
-            f.write(json.dumps({
-                "pub_id": entry["pub_id"],
-                "pub_number": entry["pub_number"],
-                "category": entry["category"],
-                "status": entry["status"],
-                "pdf_url": pdf_url,
-                "local_path": str(dest_path),
-                "result": result,
-                "timestamp": datetime.utcnow().isoformat(),
-            }) + "\n")
+    retry_pub_ids = {e["pub_id"] for e in to_retry}
+    work = new_work + to_retry
 
-    print(f"\nDownloaded : {results['downloaded']}")
-    print(f"Skipped    : {results['skipped']}  (already existed)")
-    print(f"Errors     : {results['errors']}")
-    print(f"\nLog written to: {log_path}")
+    print(f"\n  Already on disk         : {len(on_disk):>6,}  (skipping)")
+    print(f"  Permanent failures      : {len(permanent_skip):>6,}  (skipping — 404/403/no_pdf)")
+    print(f"  Transient failures      : {len(to_retry):>6,}  (retrying)")
+    print(f"  Never attempted         : {len(new_work):>6,}  (new)")
+    print(f"  {'─' * 34}")
+    print(f"  Work this run           : {len(work):>6,}\n")
+
+    if not work:
+        print("Nothing to do — all downloads are up to date.")
+        print()
+        _print_manifest_stats(manifest_path, output_dir)
+        return
+
+    # --- Download loop ---
+    session = make_session()
+
+    sess_new = 0
+    sess_retried_ok = 0
+    sess_failed = 0
+    sess_bytes = 0
+    error_counts: Counter = Counter()
+
+    with tqdm(total=len(work), unit="pdf", dynamic_ncols=True) as bar:
+        for entry in work:
+            pdf_url = entry["pdf_url"]
+            filename = pdf_url.split("/")[-1]
+            dest_path = output_dir / entry["category"] / filename
+
+            bar.set_description(f"{entry['pub_number'][:22]:<22}")
+            result, file_bytes = download_pdf(session, pdf_url, dest_path, args.delay)
+
+            if result in ("downloaded", "skipped"):
+                if entry["pub_id"] in retry_pub_ids:
+                    sess_retried_ok += 1
+                else:
+                    sess_new += 1
+                sess_bytes += file_bytes
+            else:
+                sess_failed += 1
+                error_counts[result] += 1
+                tqdm.write(f"  FAIL  {entry['pub_number']}: {result}")
+
+            with open(log_path, "a") as lf:
+                lf.write(json.dumps({
+                    "pub_id": entry["pub_id"],
+                    "pub_number": entry["pub_number"],
+                    "category": entry["category"],
+                    "status": entry["status"],
+                    "pdf_url": pdf_url,
+                    "local_path": str(dest_path),
+                    "result": result,
+                    "bytes": file_bytes,
+                    "timestamp": datetime.utcnow().isoformat(),
+                }) + "\n")
+
+            bar.update(1)
+
+    # --- Session summary ---
+    print("\n=== Session Results ===\n")
+    total_ok = sess_new + sess_retried_ok
+    print(f"  Downloaded (new)        : {sess_new:>6,}  ({_fmt_bytes(sess_bytes)})")
+    if sess_retried_ok:
+        print(f"  Downloaded (retried)    : {sess_retried_ok:>6,}")
+    print(f"  Skipped (on disk)       : {len(on_disk):>6,}")
+    print(f"  Skipped (permanent err) : {len(permanent_skip):>6,}")
+    if sess_failed:
+        print(f"  Failed this run         : {sess_failed:>6,}")
+        print()
+        print("  Failures by type:")
+        for err, count in sorted(error_counts.items(), key=lambda x: -x[1]):
+            print(f"    {err:<26} : {count:>5,}")
+
+    print(f"\n  Log written to: {log_path}\n")
+    _print_manifest_stats(manifest_path, output_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -431,6 +616,11 @@ def main() -> None:
         help="Download PDFs listed in the manifest.",
         parents=[shared],
     )
+    subparsers.add_parser(
+        "stats",
+        help="Print manifest statistics without scraping or downloading.",
+        parents=[shared],
+    )
 
     args = parser.parse_args()
 
@@ -438,6 +628,8 @@ def main() -> None:
         cmd_build(args)
     elif args.command == "download":
         cmd_download(args)
+    elif args.command == "stats":
+        cmd_stats(args)
 
 
 if __name__ == "__main__":
